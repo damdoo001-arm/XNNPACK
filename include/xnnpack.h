@@ -122,6 +122,14 @@ extern "C" {
 /// with any other codepath that could be used in the same compiled XNNPACK library.
 #define XNN_FLAG_SLOW_CONSISTENT_ARITHMETIC 0x00002000
 
+/// Allow XNNPACK to dynamically quantize floating-point activations when a
+/// quantized implementation is available.
+///
+/// Note: this flag permits lossy transformations and can change the numerical
+/// results of an otherwise floating-point operation. XNNPACK may ignore this
+/// hint when no suitable implementation is available.
+#define XNN_FLAG_HINT_DYNAMIC_QUANTIZATION 0x00008000
+
 /// The number of entries in an array of xnn_quantization_params that XNNPACK may read beyond array bounds.
 /// The caller must allocate at least this many extra xnn_quantization_params before passing the array to XNNPACK.
 ///
@@ -2490,7 +2498,8 @@ enum xnn_status xnn_get_runtime_profiling_info(xnn_runtime_t runtime,
 ///                     pool is NULL, the computation would run on the caller thread without parallelization.
 /// @param flags - binary features of the runtime. The only currently supported values are
 ///                XNN_FLAG_HINT_SPARSE_INFERENCE, XNN_FLAG_HINT_FP16_INFERENCE, XNN_FLAG_FORCE_FP16_INFERENCE,
-///                XNN_FLAG_DONT_SPIN_WORKERS, and XNN_FLAG_TRANSIENT_INDIRECTION_BUFFER. If XNN_FLAG_DONT_SPIN_WORKERS is
+///                XNN_FLAG_HINT_DYNAMIC_QUANTIZATION, XNN_FLAG_DONT_SPIN_WORKERS, and
+///                XNN_FLAG_TRANSIENT_INDIRECTION_BUFFER. If XNN_FLAG_DONT_SPIN_WORKERS is
 ///                specified, worker threads would be yielded to the system scheduler after processing the last operator
 ///                in the Runtime. If XNN_FLAG_TRANSIENT_INDIRECTION_BUFFER is specified, convolution operators will
 ///                initialize indirection buffers on each inference run using temporary memory in the workspace, instead

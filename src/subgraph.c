@@ -4005,6 +4005,8 @@ enum xnn_status xnn_subgraph_optimize_packed_lhs(xnn_subgraph_t subgraph,
               }
 #if XNN_ARCH_ARM64 && XNN_ENABLE_ARM_SME2 && XNN_ENABLE_KLEIDIAI
               else if (
+                  (optimization_flags &
+                   XNN_FLAG_HINT_DYNAMIC_QUANTIZATION) != 0 &&
                   kernel_datatype == xnn_datatype_qcint8 &&
                   node->type == xnn_node_type_batch_matrix_multiply &&
                   (optimization_flags & XNN_FLAG_NO_INLINED_LHS_PACKING) ==

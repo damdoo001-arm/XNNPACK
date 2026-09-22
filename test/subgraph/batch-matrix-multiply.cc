@@ -44,7 +44,8 @@ static bool UseQP8F32QC8WBMMOnSME2(uint64_t runtime_flags) {
 #if XNN_ARCH_ARM64 && XNN_ENABLE_ARM_SME2 && XNN_ENABLE_KLEIDIAI
   const struct xnn_hardware_config* hardware_config =
       xnn_init_hardware_config();
-  return (runtime_flags & XNN_FLAG_NO_INLINED_LHS_PACKING) == 0 &&
+  return (runtime_flags & XNN_FLAG_HINT_DYNAMIC_QUANTIZATION) != 0 &&
+         (runtime_flags & XNN_FLAG_NO_INLINED_LHS_PACKING) == 0 &&
          hardware_config != nullptr &&
          (hardware_config->arch_flags & xnn_arch_arm_sme2) != 0 &&
          xnn_init_qp8_f32_qc8w_gemm_config() != nullptr;
@@ -296,7 +297,8 @@ void TestDynamicB(xnn_datatype convert_to = xnn_datatype_invalid,
             .AddBatchMatrixMultiply(bmm_input_a_id, input_b_id, output_id,
                                     flags);
 
-    xnn_status status = subgraph.CreateRuntime();
+    xnn_status status =
+        subgraph.CreateRuntime(/*threadpool=*/nullptr, runtime_flags);
     if (status == xnn_status_unsupported_hardware) {
       GTEST_SKIP();
       return;
@@ -443,7 +445,8 @@ TEST(BatchMatrixMultiplyF32QC8W, dont_inline_lhs_dynamic_b) {
 static void TestQP8F32QC8WBMMSelection(uint32_t optimization_flags,
                                        bool expect_qp8) {
   ASSERT_EQ(xnn_status_success, xnn_initialize(nullptr));
-  if (!UseQP8F32QC8WBMMOnSME2(/*runtime_flags=*/0)) {
+  if (expect_qp8 &&
+      !UseQP8F32QC8WBMMOnSME2(XNN_FLAG_HINT_DYNAMIC_QUANTIZATION)) {
     GTEST_SKIP() << "QP8 F32 QC8W SME2 BMM is not available";
   }
 
@@ -474,14 +477,86 @@ static void TestQP8F32QC8WBMMSelection(uint32_t optimization_flags,
   }
 }
 
-TEST(BatchMatrixMultiplyQP8F32QC8W, selects_sme2_for_fp32_lhs) {
-  TestQP8F32QC8WBMMSelection(/*optimization_flags=*/0, /*expect_qp8=*/true);
+TEST(BatchMatrixMultiplyQP8F32QC8W, default_uses_f32_fallback) {
+  TestQP8F32QC8WBMMSelection(/*optimization_flags=*/0,
+                             /*expect_qp8=*/false);
+}
+
+TEST(BatchMatrixMultiplyQP8F32QC8W, opt_in_selects_sme2_for_fp32_lhs) {
+  TestQP8F32QC8WBMMSelection(
+      /*optimization_flags=*/XNN_FLAG_HINT_DYNAMIC_QUANTIZATION,
+      /*expect_qp8=*/true);
 }
 
 TEST(BatchMatrixMultiplyQP8F32QC8W, no_inline_lhs_packing_uses_f32_fallback) {
   TestQP8F32QC8WBMMSelection(
-      /*optimization_flags=*/XNN_FLAG_NO_INLINED_LHS_PACKING,
+      /*optimization_flags=*/XNN_FLAG_HINT_DYNAMIC_QUANTIZATION |
+          XNN_FLAG_NO_INLINED_LHS_PACKING,
       /*expect_qp8=*/false);
+}
+
+TEST(BatchMatrixMultiplyQP8F32QC8W, non_prequantized_fp32_lhs_accuracy) {
+  constexpr uint32_t input_a_id = 0;
+  constexpr uint32_t input_b_id = 1;
+  constexpr uint32_t output_id = 2;
+  constexpr size_t batch = 1;
+  constexpr size_t m = 16;
+  constexpr size_t k = 256;
+  constexpr size_t n = 64;
+  constexpr uint32_t runtime_flags = XNN_FLAG_HINT_DYNAMIC_QUANTIZATION;
+
+  ASSERT_EQ(xnn_status_success, xnn_initialize(nullptr));
+  if (!UseQP8F32QC8WBMMOnSME2(runtime_flags)) {
+    GTEST_SKIP() << "QP8 F32 QC8W SME2 BMM is not available";
+  }
+
+  ReplicableRandomDevice rng;
+  std::normal_distribution<float> input_dist(0.0f, 1.0f);
+  std::uniform_real_distribution<float> scale_dist(0.001f, 0.05f);
+  Tensor<float> input_a({batch, m, k}, XnnExtraBytes);
+  input_a.generate([&]() { return input_dist(rng); });
+  Tensor<qcint8> input_b({batch, k, n}, XnnExtraBytes);
+  auto input_b_gen =
+      MakeDatatypeGenerator(qcint8(), /*symmetric_range=*/true);
+  input_b.generate([&]() { return input_b_gen(rng); });
+  Tensor<float> input_b_scales({batch, 1, n});
+  input_b_scales.generate([&]() { return scale_dist(rng); });
+
+  const std::vector<size_t> output_shape = {batch, m, n};
+  Tensor<float> fallback_output(output_shape);
+  Tensor<float> sme2_output(output_shape);
+  const auto run_bmm = [&](uint32_t flags, Tensor<float>& output) {
+    SubgraphTester subgraph(/*external_value_ids=*/3);
+    subgraph
+        .AddInputTensor(input_a.shape(), input_a.base(), input_a_id)
+        .AddStaticTensorQS8(
+            input_b.shape(), /*channel_dim=*/2, TensorType::kDense,
+            input_b_scales.base(), input_b_id, /*flags=*/0,
+            reinterpret_cast<int8_t*>(input_b.data()))
+        .AddOutputTensor(output.shape(), output.base(), output_id)
+        .AddBatchMatrixMultiply(input_a_id, input_b_id, output_id);
+
+    const xnn_status status =
+        subgraph.CreateRuntime(/*threadpool=*/nullptr, flags);
+    if (status != xnn_status_success) {
+      return status;
+    }
+    return subgraph.ReshapeRuntime().SetupRuntime().InvokeRuntime();
+  };
+
+  ASSERT_EQ(xnn_status_success, run_bmm(/*flags=*/0, fallback_output));
+  ASSERT_EQ(xnn_status_success, run_bmm(runtime_flags, sme2_output));
+
+  double squared_error = 0.0;
+  double squared_reference = 0.0;
+  for (const auto& i : EnumerateIndices(output_shape)) {
+    const double reference_value = fallback_output(i);
+    const double error = static_cast<double>(sme2_output(i)) - reference_value;
+    squared_error += error * error;
+    squared_reference += reference_value * reference_value;
+  }
+  ASSERT_GT(squared_reference, 0.0);
+  EXPECT_LT(std::sqrt(squared_error / squared_reference), 0.02);
 }
 #endif  // XNNPACK_USE_YNNPACK
 
