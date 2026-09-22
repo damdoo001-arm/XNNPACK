@@ -1,5 +1,7 @@
 // Copyright 2023 Google LLC
 //
+// Copyright 2026 Arm Limited and/or its affiliates <open-source-office@arm.com>
+//
 // This source code is licensed under the BSD-style license found in the
 // LICENSE file in the root directory of this source tree.
 
@@ -19,10 +21,13 @@
 #include <gtest/gtest.h>
 #include "include/xnnpack.h"
 #include "src/xnnpack/buffer.h"
+#include "src/xnnpack/config.h"
 #include "src/xnnpack/datatype.h"
+#include "src/xnnpack/hardware-config.h"
 #include "src/xnnpack/math.h"
 #include "src/xnnpack/microparams.h"
 #include "src/xnnpack/node-type.h"
+#include "src/xnnpack/operator.h"
 #include "src/xnnpack/reference-utils.h"
 #include "src/xnnpack/quantization.h"
 #include "src/xnnpack/subgraph.h"
@@ -34,6 +39,20 @@
 namespace xnnpack {
 
 using qcint8 = quantized<int8_t, channelwise>;
+
+static bool UseQP8F32QC8WBMMOnSME2(uint64_t runtime_flags) {
+#if XNN_ARCH_ARM64 && XNN_ENABLE_ARM_SME2 && XNN_ENABLE_KLEIDIAI
+  const struct xnn_hardware_config* hardware_config =
+      xnn_init_hardware_config();
+  return (runtime_flags & XNN_FLAG_NO_INLINED_LHS_PACKING) == 0 &&
+         hardware_config != nullptr &&
+         (hardware_config->arch_flags & xnn_arch_arm_sme2) != 0 &&
+         xnn_init_qp8_f32_qc8w_gemm_config() != nullptr;
+#else
+  (void)runtime_flags;
+  return false;
+#endif
+}
 
 // Make input matrices of the given ranks, with random broadcasting, such that
 // the result of batch matrix multiply of the two operands is `output_shape`.
@@ -326,11 +345,17 @@ void TestDynamicB(xnn_datatype convert_to = xnn_datatype_invalid,
       auto input_a_gen = MakeDatatypeGenerator(InputA());
       input_a.generate([&]() { return input_a_gen(rng); });
 
-      if (convert_to != xnn_datatype_invalid) {
+      const bool implicitly_quantizes_lhs =
+          std::is_same<InputA, float>::value &&
+          std::is_same<InputB, qcint8>::value &&
+          UseQP8F32QC8WBMMOnSME2(runtime_flags);
+      if (convert_to != xnn_datatype_invalid || implicitly_quantizes_lhs) {
         std::vector<size_t> input_batches = input_a.shape();
         input_batches.pop_back();
         for (const auto& i : EnumerateIndices(input_batches)) {
-          FakeDynamicQuantize(input_a.slice_leading(i), convert_to);
+          FakeDynamicQuantize(
+              input_a.slice_leading(i),
+              implicitly_quantizes_lhs ? xnn_datatype_qdint8 : convert_to);
         }
       }
       broadcast_extent_1(input_a);
@@ -413,6 +438,50 @@ TEST(BatchMatrixMultiplyF32QC8W, dont_inline_lhs_dynamic_b) {
   TestDynamicB<float, qcint8>(/*convert_to=*/xnn_datatype_invalid,
                               /*runtime_flags=*/xnn_test_runtime_flags() |
                                 XNN_FLAG_NO_INLINED_LHS_PACKING);
+}
+
+static void TestQP8F32QC8WBMMSelection(uint32_t optimization_flags,
+                                       bool expect_qp8) {
+  ASSERT_EQ(xnn_status_success, xnn_initialize(nullptr));
+  if (!UseQP8F32QC8WBMMOnSME2(/*runtime_flags=*/0)) {
+    GTEST_SKIP() << "QP8 F32 QC8W SME2 BMM is not available";
+  }
+
+  constexpr uint32_t input_a_id = 0;
+  constexpr uint32_t input_b_id = 1;
+  constexpr uint32_t output_id = 2;
+  constexpr size_t n = 32;
+  std::vector<float> input_b_scale(n, 1.0f);
+
+  SubgraphTester subgraph(/*external_value_ids=*/3);
+  subgraph
+      .AddInputTensorF32({1, 8, 64}, input_a_id)
+      .AddStaticTensorQS8({1, 64, n}, /*channel_dim=*/2,
+                          TensorType::kDense, input_b_scale.data(), input_b_id)
+      .AddOutputTensor({1, 8, n}, xnn_datatype_fp32, output_id)
+      .AddBatchMatrixMultiply(input_a_id, input_b_id, output_id)
+      .Optimize(optimization_flags);
+
+  ASSERT_EQ(subgraph.NumNodes(), 1);
+  const struct xnn_node* bmm_node = subgraph.Node(0);
+  ASSERT_EQ(bmm_node->type, xnn_node_type_batch_matrix_multiply);
+  if (expect_qp8) {
+    EXPECT_EQ(bmm_node->packed_input_datatype, xnn_datatype_qpint8);
+    EXPECT_NE(bmm_node->flags & XNN_FLAG_INLINE_LHS_PACKING, 0);
+  } else {
+    EXPECT_EQ(bmm_node->packed_input_datatype, xnn_datatype_invalid);
+    EXPECT_EQ(bmm_node->flags & XNN_FLAG_INLINE_LHS_PACKING, 0);
+  }
+}
+
+TEST(BatchMatrixMultiplyQP8F32QC8W, selects_sme2_for_fp32_lhs) {
+  TestQP8F32QC8WBMMSelection(/*optimization_flags=*/0, /*expect_qp8=*/true);
+}
+
+TEST(BatchMatrixMultiplyQP8F32QC8W, no_inline_lhs_packing_uses_f32_fallback) {
+  TestQP8F32QC8WBMMSelection(
+      /*optimization_flags=*/XNN_FLAG_NO_INLINED_LHS_PACKING,
+      /*expect_qp8=*/false);
 }
 #endif  // XNNPACK_USE_YNNPACK
 
@@ -549,14 +618,20 @@ void TestStaticB(xnn_datatype convert_to = xnn_datatype_invalid,
       Tensor<InputA> input_a(a_shape, XnnExtraBytes);
       auto input_a_gen = MakeDatatypeGenerator(InputA());
       input_a.generate([&]() { return input_a_gen(rng); });
-      if (convert_to != xnn_datatype_invalid) {
+      const bool implicitly_quantizes_lhs =
+          std::is_same<InputA, float>::value &&
+          std::is_same<InputB, qcint8>::value &&
+          UseQP8F32QC8WBMMOnSME2(runtime_flags);
+      if (convert_to != xnn_datatype_invalid || implicitly_quantizes_lhs) {
         // If we are dynamically quantizing, preprocess the data to have zero
         // error when it will be quantized, which allows us to use a much
         // smaller tolerance for error for testing purposes.
         std::vector<size_t> input_batches = input_a.shape();
         input_batches.pop_back();
         for (const auto& i : EnumerateIndices(input_batches)) {
-          FakeDynamicQuantize(input_a.slice_leading(i), convert_to);
+          FakeDynamicQuantize(
+              input_a.slice_leading(i),
+              implicitly_quantizes_lhs ? xnn_datatype_qdint8 : convert_to);
         }
       }
       broadcast_extent_1(input_a);

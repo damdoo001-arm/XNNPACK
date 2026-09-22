@@ -3996,12 +3996,29 @@ enum xnn_status xnn_subgraph_optimize_packed_lhs(xnn_subgraph_t subgraph,
             }
             break;
           case xnn_datatype_fp32:
-            if (input_datatype == output_datatype &&
-                (kernel_datatype == xnn_datatype_fp32 ||
-                  kernel_datatype == xnn_datatype_fp16)) {
-              if ((gemm_config = xnn_init_pf32_gemm_config())) {
-                assumed_datatype = xnn_datatype_pfp32;
+            if (input_datatype == output_datatype) {
+              if (kernel_datatype == xnn_datatype_fp32 ||
+                  kernel_datatype == xnn_datatype_fp16) {
+                if ((gemm_config = xnn_init_pf32_gemm_config())) {
+                  assumed_datatype = xnn_datatype_pfp32;
+                }
               }
+#if XNN_ARCH_ARM64 && XNN_ENABLE_ARM_SME2 && XNN_ENABLE_KLEIDIAI
+              else if (
+                  kernel_datatype == xnn_datatype_qcint8 &&
+                  node->type == xnn_node_type_batch_matrix_multiply &&
+                  (optimization_flags & XNN_FLAG_NO_INLINED_LHS_PACKING) ==
+                      0) {
+                const struct xnn_hardware_config* hardware_config =
+                    xnn_init_hardware_config();
+                if (hardware_config != NULL &&
+                    (hardware_config->arch_flags & xnn_arch_arm_sme2) != 0 &&
+                    (gemm_config =
+                         xnn_init_qp8_f32_qc8w_gemm_config()) != NULL) {
+                  assumed_datatype = xnn_datatype_qpint8;
+                }
+              }
+#endif  // XNN_ARCH_ARM64 && XNN_ENABLE_ARM_SME2 && XNN_ENABLE_KLEIDIAI
             }
             break;
           case xnn_datatype_qint8:
